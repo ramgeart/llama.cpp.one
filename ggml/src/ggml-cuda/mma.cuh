@@ -205,7 +205,7 @@ namespace ggml_cuda_mma {
             }
         }
 #else
-        static constexpr int ne = I * J / 32;
+        static constexpr int ne = (I == 16 && J == 64) || (I == 64 && J == 8) ? (I * J) / 256 : (I * J) / 32;
         T x[ne] = {0};
 
         static constexpr __device__ bool supported() {
@@ -231,15 +231,8 @@ namespace ggml_cuda_mma {
             } else if constexpr (I == 32 && J == 8) {
                 return tile<16, 8, T>::get_i(l); // Memory layout simply repeated with same pattern in i direction.
             } else if constexpr (I == 16 && J == 64) {
-                // MXFP4 A (16x64). 
-                // This is complex. We need to map linear index l to i.
-                // But for now, we might not need get_i/get_j if we load manually.
-                // But tile::get_i is used by load_tile.
-                // Let's implement a placeholder or correct logic if possible.
-                // For now, return -1 to force manual loading.
                 return -1; 
             } else if constexpr (I == 64 && J == 8) {
-                // MXFP4 B (64x8).
                 return -1;
             } else {
                 NO_DEVICE_CODE;
@@ -268,26 +261,6 @@ namespace ggml_cuda_mma {
             }
         }
 #endif // defined(GGML_USE_HIP)
-    };
-
-    template <int I_, int J_>
-    struct tile<I_, J_, int, DATA_LAYOUT_I_MAJOR> {
-        static constexpr int         I  = I_;
-        static constexpr int         J  = J_;
-        static constexpr data_layout dl = DATA_LAYOUT_I_MAJOR;
-
-        // For MXFP4 (e2m1), we pack 8 elements per int.
-        // ne is number of int registers per thread.
-        static constexpr int ne = (I * J) / 256; // 256 = 32 threads * 8 elements/int
-        int x[ne] = {0};
-
-        static constexpr __device__ bool supported() {
-            if (I == 16 && J == 64) return true;
-            if (I == 64 && J ==  8) return true;
-            return false;
-        }
-        
-        // get_i/get_j not implemented for packed int tile
     };
 
 
