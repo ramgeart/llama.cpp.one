@@ -3108,6 +3108,7 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q8_0> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
+#if __CUDA_ARCH__ >= 1000
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4_native(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     
@@ -3162,6 +3163,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         }
     }
 }
+#endif // __CUDA_ARCH__ >= 1000
 
 template <int mmq_x, int mmq_y>
 static __device__ __forceinline__ void vec_dot_mxfp4_mma_native(
