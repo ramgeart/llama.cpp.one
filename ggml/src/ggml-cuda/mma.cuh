@@ -1118,13 +1118,13 @@ static __device__ __forceinline__ void mma(
 #endif // AMD_WMMA_AVAILABLE
     }
 
+#if __CUDA_ARCH__ >= 1000
     static __device__ __forceinline__ void mma(
             tile<16, 8, float> & D, 
             const tile<16, 64, int> & A, 
             const tile<64, 8, int> & B,
             int scaleA, 
             int scaleB) {
-#if __CUDA_ARCH__ >= 1000
         const int * Axi = A.x;
         const int * Bxi = B.x;
         int       * Dxi = (int *) D.x;
@@ -1135,9 +1135,6 @@ static __device__ __forceinline__ void mma(
             : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), 
               "r"(Bxi[0]), "r"(Bxi[1]),
               "r"(scaleA), "r"(scaleB));
-#else
-        GGML_UNUSED(D); GGML_UNUSED(A); GGML_UNUSED(B); GGML_UNUSED(scaleA); GGML_UNUSED(scaleB);
-        NO_DEVICE_CODE;
-#endif
     }
+#endif // __CUDA_ARCH__ >= 1000
 }
