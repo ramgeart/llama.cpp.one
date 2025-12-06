@@ -190,3 +190,110 @@ void quantize_mmq_q8_1_cuda(
             break;
     }
 }
+
+static __global__ void quantize_mmq_mxfp4_mmq(
+        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2) {
+
+    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i1 = blockIdx.x;
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+
+    const int64_t i00 = i0;
+    const int64_t i01 = ids ? ids[i1] : i1;
+    const int64_t i02 = i2;
+    const int64_t i03 = i3;
+
+    const float4 * x4 = (const float4 *) x;
+    block_mxfp4_mmq * y = (block_mxfp4_mmq *) vy;
+
+    const int64_t blocks_per_row = ne0 / 128;
+    const int64_t ib = blockIdx.z * (ne1 * blocks_per_row) + i1 * blocks_per_row + blockIdx.y;
+    
+    const float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+    
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 4));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 1));
+    
+    int E = 0;
+    if (amax > 0) {
+        int exp;
+        frexpf(amax / 6.0f, &exp);
+        E = exp + 127;
+        if (E < 0) E = 0;
+        if (E > 255) E = 255;
+    }
+    
+    uint8_t scale_bits = (uint8_t)E;
+    float scale = ldexpf(1.0f, E - 127);
+    float inv_scale = 1.0f / scale;
+    
+    auto quantize_e2m1 = [&](float v) -> uint8_t {
+        uint8_t sign = (v < 0) ? 8 : 0;
+        float av = fabsf(v) * inv_scale;
+        uint8_t q = 0;
+        if (av < 0.25f) q = 0;
+        else if (av < 0.75f) q = 1;
+        else if (av < 1.25f) q = 2;
+        else if (av < 1.75f) q = 3;
+        else if (av < 2.5f) q = 4;
+        else if (av < 3.5f) q = 5;
+        else if (av < 5.0f) q = 6;
+        else q = 7;
+        return sign | q;
+    };
+    
+    uint8_t q0 = quantize_e2m1(xi.x);
+    uint8_t q1 = quantize_e2m1(xi.y);
+    uint8_t q2 = quantize_e2m1(xi.z);
+    uint8_t q3 = quantize_e2m1(xi.w);
+    
+    uint32_t packed = q0 | (q1 << 4) | (q2 << 8) | (q3 << 12);
+    
+    uint32_t neighbor = __shfl_xor_sync(0xFFFFFFFF, packed, 1);
+    if (threadIdx.x & 1) {
+        packed = (packed << 16) | neighbor;
+    } else {
+        packed = packed | (neighbor << 16);
+    }
+    
+    if ((threadIdx.x & 1) == 0) {
+        y[ib].data[threadIdx.x / 2] = packed;
+    }
+    
+    uint32_t s_val = scale_bits;
+    uint32_t s0 = __shfl_sync(0xFFFFFFFF, s_val, 0);
+    uint32_t s1 = __shfl_sync(0xFFFFFFFF, s_val, 8);
+    uint32_t s2 = __shfl_sync(0xFFFFFFFF, s_val, 16);
+    uint32_t s3 = __shfl_sync(0xFFFFFFFF, s_val, 24);
+    
+    if (threadIdx.x == 0) {
+        y[ib].scales[0] = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24);
+    }
+}
+
+void quantize_mmq_mxfp4_mmq_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream) {
+    
+    const int num_blocks = ne0 / 128;
+    const dim3 block_dims(32, 1, 1);
+    const dim3 grid_dims(ne1, num_blocks, ne2*ne3);
+    
+    quantize_mmq_mxfp4_mmq<<<grid_dims, block_dims, 0, stream>>>(
+        x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+}

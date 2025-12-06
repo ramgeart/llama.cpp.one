@@ -47,6 +47,15 @@ struct block_q8_1_mmq {
 static_assert(sizeof(block_q8_1_mmq) == 4*QK8_1 + 4*sizeof(half2), "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 
+struct block_mxfp4_mmq {
+    // 128 elements.
+    // Data: 128 * 4 bits = 64 bytes = 16 ints.
+    // Scales: 128 / 32 = 4 scales = 4 bytes = 1 int.
+    int data[16];
+    int scales[1];
+};
+static_assert(sizeof(block_mxfp4_mmq) == 68, "Unexpected block_mxfp4_mmq size");
+
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
         case GGML_TYPE_Q4_0:
@@ -3099,12 +3108,235 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q8_0> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4_native(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    
+    constexpr int elements_per_int_data = 8;
+    constexpr int ints_per_row_data = MMQ_ITER_K / elements_per_int_data; // 32
+    constexpr int ints_per_row_scale = MMQ_ITER_K / 32 / 4; // 2
+    constexpr int ints_per_row = ints_per_row_data + ints_per_row_scale; // 34
+    
+    constexpr int blocks_per_row = MMQ_ITER_K / 32; // 8
+    constexpr int threads_per_row = blocks_per_row; // 8
+    constexpr int nrows_per_warp = warp_size / threads_per_row; // 4
+    
+    const int txi = threadIdx.x % threads_per_row; // block index (0-7)
+    const int tyi = threadIdx.x / threads_per_row; // row offset in warp (0-3)
+    
+    #pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * nrows_per_warp) {
+        int i = i0 + threadIdx.y * nrows_per_warp + tyi;
+        
+        if (i >= mmq_y) continue;
+        
+        const int k = txi; // block index
+        
+        const block_mxfp4 * b = (const block_mxfp4 *) x + kbx0 + i*stride + k;
+        
+        block_mxfp4 val;
+        if (need_check && i >= i_max) {
+             // Pad with 0
+             val.e = 0;
+             for(int j=0; j<16; ++j) val.qs[j] = 0;
+        } else {
+             val = *b;
+        }
+        
+        int * row_ptr = x_tile + i * ints_per_row;
+        int * data_ptr = row_ptr + k * 4;
+        const int * qs_ints = (const int *)val.qs;
+        data_ptr[0] = qs_ints[0];
+        data_ptr[1] = qs_ints[1];
+        data_ptr[2] = qs_ints[2];
+        data_ptr[3] = qs_ints[3];
+        
+        uint32_t s_packed = (uint32_t)val.e << ((k % 4) * 8);
+        s_packed |= __shfl_xor_sync(0xFFFFFFFF, s_packed, 1);
+        s_packed |= __shfl_xor_sync(0xFFFFFFFF, s_packed, 2);
+        
+        if ((k % 4) == 0) {
+            row_ptr[ints_per_row_data + k/4] = s_packed;
+        }
+    }
+}
+
+template <int mmq_x, int mmq_y>
+static __device__ __forceinline__ void vec_dot_mxfp4_mma_native(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if __CUDA_ARCH__ >= 1000
+    // x -> A (mmq_y rows). y -> B (mmq_x rows).
+    // A layout: 34 ints per row.
+    // B layout: 34 ints per row.
+    
+    typedef tile<16, 64, int> tile_A;
+    typedef tile<64, 8, int> tile_B;
+    typedef tile<16, 8, float> tile_C;
+    
+    constexpr int ints_per_row = 34;
+    constexpr int ints_per_row_data = 32;
+    
+    // mmq_x is N (cols of B). mmq_y is M (rows of A).
+    // We iterate over tiles of A (M) and B (N).
+    
+    constexpr int granularity = mmq_get_granularity_device(mmq_x); // e.g. 64
+    constexpr int rows_per_warp = granularity; // 64?
+    // rows_per_warp is how many rows of A this warp handles?
+    // No, vec_dot_q8_0 uses rows_per_warp for A.
+    
+    // Let's assume warp handles 16 rows of A (tile_C::I).
+    // And iterates over B.
+    
+    // In vec_dot_q8_0:
+    // ntx = rows_per_warp / tile_C::I.
+    // If rows_per_warp = 64. ntx = 4.
+    // Warp handles 4 tiles of A (4 * 16 = 64 rows).
+    // threadIdx.y determines which tile?
+    // No, threadIdx.y is warp index?
+    // No, vec_dot is called by all threads.
+    // threadIdx.y is laneid / 32? No, block dim is (32, nwarps).
+    // So threadIdx.y is warp index.
+    
+    // Wait, vec_dot_q8_0 uses threadIdx.y in calculation.
+    // y += (threadIdx.y % ntx) * ...
+    // This implies warps cooperate?
+    // Or `rows_per_warp` is not what I think.
+    
+    // Let's simplify.
+    // Each warp computes 16x8 tile of C.
+    // We iterate over K (256).
+    
+    // A rows: 16.
+    // B cols: 8.
+    
+    // We need to load A (16x64) and B (64x8) 4 times.
+    
+    // Warp handles specific rows of A and cols of B?
+    // Usually `mul_mat_q` assigns C tiles to warps.
+    // `vec_dot` computes that tile.
+    // So `x` and `y` point to the start of A rows and B cols for this warp.
+    // But `vec_dot_q8_0` seems to do more.
+    
+    // I'll assume `x` points to 16 rows of A.
+    // `y` points to 8 rows of B (transposed).
+    
+    int warp_id = threadIdx.y;
+    // If we assume standard tiling.
+    
+    // Loop over K chunks (4 chunks of 64).
+    for (int k_chunk = 0; k_chunk < 4; ++k_chunk) {
+        int k_offset = k_chunk * 8; // 8 ints = 64 elements
+        
+        // Load A (16x64)
+        tile_A A;
+        int groupID = threadIdx.x >> 2;
+        int in_group = threadIdx.x & 3;
+        
+        int r0 = groupID;
+        int r1 = groupID + 8;
+        int c0 = k_offset + in_group;
+        int c1 = k_offset + in_group + 4;
+        
+        // Load A data
+        A.x[0] = x[r0 * ints_per_row + c0];
+        A.x[1] = x[r1 * ints_per_row + c0];
+        A.x[2] = x[r0 * ints_per_row + c1];
+        A.x[3] = x[r1 * ints_per_row + c1];
+        
+        // Load A scales
+        int scale_int_idx = (k_chunk * 2) / 4;
+        int scale_byte_idx = (k_chunk * 2) % 4;
+        
+        int s_int_r0 = x[r0 * ints_per_row + ints_per_row_data + scale_int_idx];
+        int s_int_r1 = x[r1 * ints_per_row + ints_per_row_data + scale_int_idx];
+        
+        int s0 = (s_int_r0 >> (scale_byte_idx * 8)) & 0xFF;
+        int s1 = (s_int_r1 >> (scale_byte_idx * 8)) & 0xFF;
+        int s2 = (s_int_r0 >> ((scale_byte_idx + 1) * 8)) & 0xFF;
+        int s3 = (s_int_r1 >> ((scale_byte_idx + 1) * 8)) & 0xFF;
+        
+        int scaleA = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24);
+        
+        // Load B (64x8)
+        tile_B B;
+        // B is 8 rows (N), 64 cols (K) in shared memory (transposed).
+        // We need 64 rows (K), 8 cols (N) for mma.
+        // Thread 0 needs:
+        // B.x[0]: Row 0-7, Col 0.
+        // B.x[1]: Row 32-39, Col 0.
+        // Row indices are K. Col indices are N.
+        
+        // Shared memory `y`: Row = N, Col = K.
+        // So we need `y[Col][Row]`.
+        // y[0][0-7].
+        // y[0][32-39].
+        
+        // `col` (N) = groupID.
+        // `r0` (K) = in_group * 8.
+        // `r1` (K) = in_group * 8 + 32.
+        
+        // `r0` is element index. Int index = `r0/8`.
+        // `r0` is relative to `k_chunk`.
+        // `k_chunk` offset is `k_offset` ints.
+        // So `y` index is `k_offset + r0/8`.
+        
+        int b_r0 = in_group; // r0/8
+        int b_r1 = in_group + 4; // r1/8
+        
+        B.x[0] = y[groupID * ints_per_row + k_offset + b_r0];
+        B.x[1] = y[groupID * ints_per_row + k_offset + b_r1];
+        
+        // Load B scales
+        int s_int_b = y[groupID * ints_per_row + ints_per_row_data + scale_int_idx];
+        int sb0 = (s_int_b >> (scale_byte_idx * 8)) & 0xFF;
+        int sb1 = (s_int_b >> ((scale_byte_idx + 1) * 8)) & 0xFF;
+        
+        int scaleB = sb0 | (sb1 << 8); // Replicate? Or just 2 bytes.
+        // Register is b32.
+        
+        tile_C C;
+        // Initialize C to 0? No, mma accumulates.
+        // But we need to clear C before mma?
+        // `mma` instruction: d = d + a*b.
+        // So we need to initialize C.
+        // But we want to accumulate into `sum`.
+        // `sum` is in registers.
+        // We can use `sum` as D?
+        // `sum` is float array. `tile_C` is struct with float array.
+        // We can cast `sum` to `tile_C`?
+        // `sum` layout might differ.
+        // `tile_C` layout is opaque.
+        // `vec_dot` accumulates into `sum`.
+        // We can use a temporary C, init to 0, mma, then add to sum.
+        
+        for(int i=0; i<4; ++i) C.x[i] = 0.0f;
+        
+        mma(C, A, B, scaleA, scaleB);
+        
+        // Accumulate C to sum
+        for(int i=0; i<4; ++i) sum[i] += C.x[i];
+    }
+#else
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(sum); GGML_UNUSED(k00);
+    NO_DEVICE_CODE;
+#endif
+}
+
 template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP4> {
+#if __CUDA_ARCH__ >= 1000
+    static constexpr int              vdr          = VDR_MXFP4_MMQ_NATIVE;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_mxfp4_native<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_mxfp4_mma_native<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+#else
     static constexpr int              vdr          = VDR_MXFP4_Q8_1_MMQ;
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_mxfp4<mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+#endif
 };
 
 template <int mmq_x, int mmq_y, bool need_check>

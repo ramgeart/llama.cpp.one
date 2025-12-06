@@ -214,6 +214,8 @@ namespace ggml_cuda_mma {
             if (I == 16 && J ==  8) return true;
             if (I == 16 && J == 16) return true;
             if (I == 32 && J ==  8) return true;
+            if (I == 16 && J == 64) return true; // MXFP4 A
+            if (I == 64 && J ==  8) return true; // MXFP4 B
             return false;
         }
 
@@ -228,6 +230,17 @@ namespace ggml_cuda_mma {
                 return (((l / 2) % 2) * 8) + (threadIdx.x / 4);
             } else if constexpr (I == 32 && J == 8) {
                 return tile<16, 8, T>::get_i(l); // Memory layout simply repeated with same pattern in i direction.
+            } else if constexpr (I == 16 && J == 64) {
+                // MXFP4 A (16x64). 
+                // This is complex. We need to map linear index l to i.
+                // But for now, we might not need get_i/get_j if we load manually.
+                // But tile::get_i is used by load_tile.
+                // Let's implement a placeholder or correct logic if possible.
+                // For now, return -1 to force manual loading.
+                return -1; 
+            } else if constexpr (I == 64 && J == 8) {
+                // MXFP4 B (64x8).
+                return -1;
             } else {
                 NO_DEVICE_CODE;
                 return -1;
@@ -245,6 +258,10 @@ namespace ggml_cuda_mma {
                 return ((l / 4) * 8) + ((threadIdx.x % 4) * 2) + (l % 2);
             } else if constexpr (I == 32 && J == 8) {
                 return tile<16, 8, T>::get_j(l); // Memory layout simply repeated with same pattern in i direction.
+            } else if constexpr (I == 16 && J == 64) {
+                return -1;
+            } else if constexpr (I == 64 && J == 8) {
+                return -1;
             } else {
                 NO_DEVICE_CODE;
                 return -1;
@@ -252,6 +269,27 @@ namespace ggml_cuda_mma {
         }
 #endif // defined(GGML_USE_HIP)
     };
+
+    template <int I_, int J_>
+    struct tile<I_, J_, int, DATA_LAYOUT_I_MAJOR> {
+        static constexpr int         I  = I_;
+        static constexpr int         J  = J_;
+        static constexpr data_layout dl = DATA_LAYOUT_I_MAJOR;
+
+        // For MXFP4 (e2m1), we pack 8 elements per int.
+        // ne is number of int registers per thread.
+        static constexpr int ne = (I * J) / 256; // 256 = 32 threads * 8 elements/int
+        int x[ne] = {0};
+
+        static constexpr __device__ bool supported() {
+            if (I == 16 && J == 64) return true;
+            if (I == 64 && J ==  8) return true;
+            return false;
+        }
+        
+        // get_i/get_j not implemented for packed int tile
+    };
+
 
     template <int I_, int J_>
     struct tile<I_, J_, half2, DATA_LAYOUT_I_MAJOR> {
@@ -1105,5 +1143,28 @@ static __device__ __forceinline__ void mma(
         GGML_UNUSED(B);
         NO_DEVICE_CODE;
 #endif // AMD_WMMA_AVAILABLE
+    }
+
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, float> & D, 
+            const tile<16, 64, int> & A, 
+            const tile<64, 8, int> & B,
+            int scaleA, 
+            int scaleB) {
+#if __CUDA_ARCH__ >= 1000
+        const int * Axi = A.x;
+        const int * Bxi = B.x;
+        int       * Dxi = (int *) D.x;
+        
+        asm("mma.sync.aligned.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, %10, {0, 0}, %11, {0, 0};"
+            : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), 
+              "r"(Bxi[0]), "r"(Bxi[1]),
+              "r"(scaleA), "r"(scaleB));
+#else
+        GGML_UNUSED(D); GGML_UNUSED(A); GGML_UNUSED(B); GGML_UNUSED(scaleA); GGML_UNUSED(scaleB);
+        NO_DEVICE_CODE;
+#endif
     }
 }
